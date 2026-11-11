@@ -153,7 +153,10 @@ jobs:
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$name", $pw)
           $work = "C:\mcprobe-work"
           New-Item -ItemType Directory -Force $work | Out-Null
-          icacls $work /grant "${name}:(OI)(CI)F" | Out-Null
+          # Owner-only like a user profile: C:\ grants Users read, which new
+          # files would inherit and the token check rightly refuses.
+          icacls $work /inheritance:r /grant:r "${name}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+          icacls $work
           # Run the binary in place (it may load DLLs from target/), readable by
           # the new user; its temp files go to a directory it owns.
           icacls $env:GITHUB_WORKSPACE /grant "${name}:(OI)(CI)RX" /T /Q | Out-Null
