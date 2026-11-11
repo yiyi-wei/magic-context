@@ -10,6 +10,7 @@
 //! characters. Anything else is ignored with a warning that names the failed
 //! check and never the contents, and the process keeps the random token.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub const TOKEN_FILE_NAME: &str = "dashboard-token";
@@ -26,21 +27,44 @@ pub enum TokenFile {
     Rejected(&'static str),
 }
 
-/// `<XDG_DATA_HOME or ~/.local/share>/cortexkit/magic-context/dashboard-token`,
-/// the same storage directory the plugin uses on every platform
-/// (packages/plugin/src/shared/data-path.ts). An empty `XDG_DATA_HOME` counts as
-/// unset, matching the shell's `${XDG_DATA_HOME:-...}`. `None` when no absolute
-/// path can be formed, so the token is never read relative to the working
-/// directory.
+/// `dashboard-token` in the storage directory the plugin uses on every platform,
+/// resolved in the plugin's order (packages/plugin/src/shared/data-path.ts):
+/// `MAGIC_CONTEXT_STORAGE_DIR`, then `<XDG_DATA_HOME>/cortexkit/magic-context`,
+/// then `~/.local/share/cortexkit/magic-context`. Blank values count as unset,
+/// matching the plugin's trim and the shell's `${XDG_DATA_HOME:-...}`. `None`
+/// when no absolute path can be formed (including a relative
+/// `MAGIC_CONTEXT_STORAGE_DIR`, which the plugin refuses too), so the token is
+/// never read relative to the working directory.
 pub fn default_token_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))?;
-    let path = base
-        .join("cortexkit")
-        .join("magic-context")
-        .join(TOKEN_FILE_NAME);
+    token_path_from(
+        std::env::var_os("MAGIC_CONTEXT_STORAGE_DIR"),
+        std::env::var_os("XDG_DATA_HOME"),
+        dirs::home_dir(),
+    )
+}
+
+fn token_path_from(
+    storage_dir: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let non_blank = |value: OsString| -> Option<PathBuf> {
+        match value.to_str() {
+            Some(text) => Some(text.trim())
+                .filter(|t| !t.is_empty())
+                .map(PathBuf::from),
+            None => Some(PathBuf::from(value)),
+        }
+    };
+    let dir = match storage_dir.and_then(non_blank) {
+        Some(explicit) => explicit,
+        None => xdg_data_home
+            .and_then(non_blank)
+            .or_else(|| home.map(|home| home.join(".local").join("share")))?
+            .join("cortexkit")
+            .join("magic-context"),
+    };
+    let path = dir.join(TOKEN_FILE_NAME);
     path.is_absolute().then_some(path)
 }
 
@@ -146,11 +170,11 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
     };
 
     let file = match OpenOptions::new()
-        // The exact bits, not GENERIC_READ: GENERIC_READ also asks for
-        // SYNCHRONIZE and READ_CONTROL (0x120089 & 0x120116 overlap with
-        // FILE_GENERIC_WRITE), so a `deny write` ACE would refuse an open that
-        // only wants to read. FILE_READ_ATTRIBUTES is what std's metadata()
-        // needs; READ_CONTROL is what GetSecurityInfo needs below.
+        // Only what the checks need: FILE_READ_DATA for the contents,
+        // FILE_READ_ATTRIBUTES for std's metadata(), READ_CONTROL for
+        // GetSecurityInfo below. CreateFileW still adds SYNCHRONIZE for a
+        // synchronous handle, so an entry that denies it (`deny write` does)
+        // refuses the open; that is reported as access denied, never trusted.
         .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL)
         // Opens a symlink or junction itself instead of its target.
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -331,9 +355,11 @@ mod windows_acl {
             match u32::from(header.AceType) {
                 ACCESS_DENIED_ACE_TYPE => {}
                 ACCESS_ALLOWED_ACE_TYPE => {
-                    let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
-                    let sid = &allowed.SidStart as *const u32 as PSID;
-                    if allowed.Mask != 0 && !trusted(sid, user) {
+                    let allowed = ace as *const ACCESS_ALLOWED_ACE;
+                    // The SID runs past the 4-byte SidStart field, so derive the
+                    // pointer from the ACE itself rather than from a reference.
+                    let sid = std::ptr::addr_of!((*allowed).SidStart) as PSID;
+                    if (*allowed).Mask != 0 && !trusted(sid, user) {
                         return Err(OTHER_USERS);
                     }
                 }
@@ -486,6 +512,53 @@ mod tests {
 mod content_tests {
     use super::*;
 
+    fn abs(tail: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:\\{tail}"))
+        } else {
+            PathBuf::from(format!("/{tail}"))
+        }
+    }
+
+    fn os(path: &Path) -> Option<OsString> {
+        Some(path.as_os_str().to_owned())
+    }
+
+    #[test]
+    fn storage_dir_override_wins_like_the_plugin() {
+        let store = abs("store");
+        assert_eq!(
+            token_path_from(os(&store), os(&abs("xdg")), Some(abs("home"))),
+            Some(store.join(TOKEN_FILE_NAME))
+        );
+    }
+
+    #[test]
+    fn relative_storage_dir_override_is_not_used() {
+        assert_eq!(
+            token_path_from(Some("rel".into()), os(&abs("xdg")), Some(abs("home"))),
+            None
+        );
+    }
+
+    #[test]
+    fn xdg_then_home_when_no_override() {
+        let tail = |base: PathBuf| {
+            base.join("cortexkit")
+                .join("magic-context")
+                .join(TOKEN_FILE_NAME)
+        };
+        assert_eq!(
+            token_path_from(Some("  ".into()), os(&abs("xdg")), Some(abs("home"))),
+            Some(tail(abs("xdg")))
+        );
+        assert_eq!(
+            token_path_from(None, Some("".into()), Some(abs("home"))),
+            Some(tail(abs("home").join(".local").join("share")))
+        );
+        assert_eq!(token_path_from(None, None, None), None);
+    }
+
     #[test]
     fn utf8_byte_order_mark_is_ignored() {
         let token = "x".repeat(MIN_TOKEN_LEN);
@@ -637,22 +710,33 @@ mod windows_tests {
         }
     }
 
-    /// A deny entry takes access away, so it must never be read as a grant.
-    /// Opening the file for the check asks for READ_CONTROL, which sits inside
-    /// the `deny write` mask, so the open itself can be refused before the
-    /// access list is read. Either outcome is safe; a grant is what is not, and
-    /// `it could not be opened` is not an acceptable explanation.
+    /// A deny entry takes access away, so it is never read as a grant. With
+    /// `deny write` the open is refused first: FILE_GENERIC_WRITE contains
+    /// SYNCHRONIZE, which CreateFileW requests for every synchronous handle.
     #[test]
-    fn deny_entry_is_never_read_as_a_grant() {
+    fn deny_write_entry_refuses_the_open() {
         let dir = tempdir().unwrap();
         let sddl = format!("D:P(D;;FW;;;WD)(A;;FA;;;{})", user_sid());
         let path = token_file_with_dacl(dir.path(), &sddl);
-        let outcome = read_token_file(&path);
-        assert_ne!(outcome, TokenFile::Rejected(OTHER_USERS), "{sddl}");
-        assert!(
-            outcome == TokenFile::Loaded(GOOD.to_string())
-                || outcome == TokenFile::Rejected("access to it was denied"),
-            "unexpected outcome: {outcome:?}"
+        assert_eq!(
+            read_token_file(&path),
+            TokenFile::Rejected("access to it was denied"),
+            "{sddl}"
+        );
+    }
+
+    /// A deny entry that leaves the open's access alone is skipped: it only
+    /// takes access away, so the file stays owner-only and is used.
+    #[test]
+    fn deny_entry_outside_the_open_is_skipped() {
+        let dir = tempdir().unwrap();
+        // WD = WRITE_DAC: denies nothing the open asks for.
+        let sddl = format!("D:P(D;;WD;;;WD)(A;;FA;;;{})", user_sid());
+        let path = token_file_with_dacl(dir.path(), &sddl);
+        assert_eq!(
+            read_token_file(&path),
+            TokenFile::Loaded(GOOD.to_string()),
+            "{sddl}"
         );
     }
 

@@ -54,26 +54,27 @@ On a headless or WSL2 host (no display) it just prints the URL; open it in a bro
 
 **Security:** access is gated by a per-process random token delivered in the URL fragment (never sent to the server or logged) and sent as an `Authorization: Bearer` header on each request. By default the server only binds loopback (`127.0.0.1`) and only accepts requests whose `Host` is loopback, which blocks DNS-rebinding. The token is required for every data request; the page shell itself carries no data.
 
-**Stable token (optional):** to keep the same URL across restarts, for example a bookmark or an always-on service behind a private network, create a `dashboard-token` file in the Magic Context storage directory, `${XDG_DATA_HOME:-~/.local/share}/cortexkit/magic-context/dashboard-token`, readable only by you. On macOS and Linux:
+**Stable token (optional):** to keep the same URL across restarts, for example a bookmark or an always-on service behind a private network, create a `dashboard-token` file in the Magic Context storage directory, readable only by you. That is `$MAGIC_CONTEXT_STORAGE_DIR/dashboard-token` when you set that override, otherwise `${XDG_DATA_HOME:-~/.local/share}/cortexkit/magic-context/dashboard-token`. On macOS and Linux:
 
 ```sh
-dir="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/magic-context"
+dir="${MAGIC_CONTEXT_STORAGE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/magic-context}"
 (umask 077 && openssl rand -hex 32 > "$dir/dashboard-token")
 ```
 
-On Windows (PowerShell), the file lives under `%USERPROFILE%\.local\share` unless `XDG_DATA_HOME` is set:
+On Windows (PowerShell), the file lives under `%USERPROFILE%\.local\share` unless one of those variables is set:
 
 ```powershell
-$dir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { "$env:USERPROFILE\.local\share" }
-$file = "$dir\cortexkit\magic-context\dashboard-token"
+$data = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { "$env:USERPROFILE\.local\share" }
+$dir = if ($env:MAGIC_CONTEXT_STORAGE_DIR) { $env:MAGIC_CONTEXT_STORAGE_DIR } else { "$data\cortexkit\magic-context" }
+$file = "$dir\dashboard-token"
 $bytes = New-Object byte[] 32
 [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
 -join ($bytes | ForEach-Object { $_.ToString('x2') }) | Set-Content -NoNewline -Encoding ascii $file
 ```
 
-A file created under your profile already inherits access for only you, SYSTEM and Administrators. If it is somewhere else, or the dashboard warns that other users can access it, reset its access list with `icacls $file /inheritance:r /grant:r "$env:USERDOMAIN\${env:USERNAME}:F"`.
+A file created under your profile already inherits access for only you, SYSTEM and Administrators. If it is somewhere else, or the dashboard warns that other users can access it, replace its access list with one entry for you: `icacls $file /reset` followed by `icacls $file /inheritance:r /grant:r "*$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value):F"`. `/reset` drops entries someone granted on the file directly, and `/inheritance:r` drops the ones it inherited.
 
-`--serve` then uses that token instead of a random one. Because the token outlives the process, the dashboard never prints it or hands it to the browser launcher: it prints `Using the stable token from <path>` and the URL with a `<token>` placeholder, and does not open a browser. Open `http://127.0.0.1:9077/#token=` followed by the file's contents yourself, or bookmark it. The file is used only when it is a regular file (not a symlink) that only you can read: on macOS and Linux, owned by you with mode exactly `0600`; on Windows, owned by you (or by Administrators, as an elevated shell creates it) and with an access list that grants access to no one but you, SYSTEM and Administrators. Its contents, after trimming whitespace, must be 32 to 512 characters from `A–Z a–z 0–9 - . _ ~`. Otherwise the dashboard prints a warning naming the failed check and falls back to a random token. A stable token does not change the binding rules: reaching the dashboard from another machine still needs `--host` and `--allow-remote`. Anyone with the token has the same access you do, so treat the file like a password and delete or replace it to revoke access.
+`--serve` then uses that token instead of a random one. Because the token outlives the process, the dashboard never prints it or hands it to the browser launcher: it prints `Using the stable token from <path>` and the URL with a `<token>` placeholder, and does not open a browser. Open `http://127.0.0.1:9077/#token=` followed by the file's contents yourself, or bookmark it. The file is used only when it is a regular file (not a symlink) that only you can read: on macOS and Linux, owned by you with mode exactly `0600`; on Windows, owned by you (or by SYSTEM or Administrators, as an elevated shell creates it) and with an access list that grants access to no one but you, SYSTEM and Administrators. Its contents, after trimming whitespace, must be 32 to 512 characters from `A–Z a–z 0–9 - . _ ~`. Otherwise the dashboard prints a warning naming the failed check and falls back to a random token. A stable token does not change the binding rules: reaching the dashboard from another machine still needs `--host` and `--allow-remote`. Anyone with the token has the same access you do, so treat the file like a password and delete or replace it to revoke access.
 
 ## Updates
 
