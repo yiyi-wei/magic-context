@@ -487,11 +487,15 @@ mod macos_acl {
 
     pub(super) fn check_owner_only(file: &File) -> Result<(), &'static str> {
         let me = current_user_uuid()?;
+        // SAFETY: `errno` is thread-local and writable; clearing it first means a
+        // NULL return that failed to set it cannot be misread as "no ACL" below.
+        unsafe { *libc::__error() = 0 };
         // SAFETY: the file handle stays open for the whole call.
         let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
         if acl.is_null() {
             // Ordinary case: no extended ACL at all, so the mode bits checked
-            // by the caller are the whole story. Anything else is unreadable.
+            // by the caller are the whole story. Anything else -- including a
+            // failure that left errno untouched -- is unreadable.
             return match std::io::Error::last_os_error().kind() {
                 ErrorKind::NotFound => Ok(()),
                 _ => Err(UNREADABLE),
@@ -905,9 +909,11 @@ mod macos_acl_tests {
     #[test]
     fn entry_count_comes_from_the_filesec_size() {
         // KAUTH_FILESEC_SIZE(count) = header + count * entry, measured against
-        // acl_size() on this platform for 1, 2, 3, 5 and 7 entries.
-        assert_eq!(macos_acl::entry_count(68), Some(1));
-        assert_eq!(macos_acl::entry_count(212), Some(7));
+        // acl_size() on this platform for 1, 2, 3, 4, 5 and 6 entries
+        // (68, 92, 116, 140, 164, 188).
+        for (size, count) in [(68, 1), (92, 2), (116, 3), (140, 4), (164, 5), (188, 6)] {
+            assert_eq!(macos_acl::entry_count(size), Some(count));
+        }
         // Too small to hold even the header, or a size that is not a whole
         // number of entries, means the list cannot be trusted.
         assert_eq!(macos_acl::entry_count(43), None);
@@ -1111,8 +1117,9 @@ mod windows_tests {
         SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        GetSecurityDescriptorDacl, GetTokenInformation, TokenElevation, TokenUser, ACL,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1151,6 +1158,30 @@ mod windows_tests {
             let out = String::from_utf16(std::slice::from_raw_parts(text, len)).unwrap();
             LocalFree(text as _);
             out
+        }
+    }
+
+    /// Whether this process runs with an elevated token. `icacls /setowner`
+    /// needs SeRestorePrivilege, which only an elevated caller can enable.
+    fn process_is_elevated() -> bool {
+        unsafe {
+            let mut token = null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0
+            );
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            assert_ne!(ok, 0);
+            elevation.TokenIsElevated != 0
         }
     }
 
@@ -1299,9 +1330,11 @@ mod windows_tests {
 
     /// Changing the owner to another principal needs SeRestorePrivilege, which
     /// `icacls /setowner` enables for an elevated caller (CI runners are).
-    /// Without elevation the owner cannot be set, so the test skips instead of
-    /// failing: a red result here always means the owner check is wrong. That
-    /// also means the foreign-owner refusal is untested in a non-elevated run.
+    /// Only a non-elevated caller may skip: if the process *is* elevated and the
+    /// owner still could not be set, the case is not being exercised and the
+    /// test must go red rather than quiet.
+    ///
+    /// That also means the foreign-owner refusal is untested in a non-elevated run.
     #[test]
     fn file_owned_by_another_principal_is_refused() {
         let dir = tempdir().unwrap();
@@ -1313,24 +1346,41 @@ mod windows_tests {
             .output()
             .unwrap();
         if !output.status.success() {
+            let detail = format!(
+                "stdout: {} stderr: {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            assert!(
+                !process_is_elevated(),
+                "icacls /setowner failed even though this process is elevated, so the \
+                 foreign-owner refusal is not being exercised: {detail}"
+            );
             eprintln!(
-                "skipped: icacls /setowner failed (needs an elevated shell), so the \
-                 foreign-owner refusal is not tested in this run: {}",
-                String::from_utf8_lossy(&output.stdout).trim()
+                "skipped: not elevated, so the foreign-owner refusal is not tested in \
+                 this run: {detail}"
             );
             return;
         }
         assert_eq!(read_token_file(&path), TokenFile::Rejected(NOT_OWNER));
     }
 
-    /// Needs the symlink privilege (elevated shell or Developer Mode).
+    /// Needs the symlink privilege (elevated shell or Developer Mode). Same rule
+    /// as the owner test: only a non-elevated caller may skip.
     #[test]
     fn symlink_is_refused_even_to_a_good_target() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("real-token");
         fs::write(&target, GOOD).unwrap();
         let link = dir.path().join(TOKEN_FILE_NAME);
-        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        if let Err(err) = std::os::windows::fs::symlink_file(&target, &link) {
+            assert!(
+                !process_is_elevated(),
+                "symlink creation failed even though this process is elevated: {err}"
+            );
+            eprintln!("skipped: not elevated, symlink refusal not tested this run: {err}");
+            return;
+        }
         assert_eq!(
             read_token_file(&target),
             TokenFile::Loaded(GOOD.to_string())

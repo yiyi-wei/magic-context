@@ -170,7 +170,7 @@ jobs:
           Write-Host "--- stdout ---"; Write-Host $stdout
           Write-Host "--- stderr ---"; Write-Host $stderr
           if ($p.ExitCode -ne 0) { throw "tests failed as a standard user (exit $($p.ExitCode))" }
-          if (-not "$stdout$stderr".Contains("skipped: icacls /setowner failed")) {
+          if (-not "$stdout$stderr".Contains("skipped: not elevated")) {
             throw "expected the foreign-owner test to skip for a standard user"
           }
           Write-Host "NON-ELEVATED OK: all serve:: tests pass, foreign-owner test skipped"

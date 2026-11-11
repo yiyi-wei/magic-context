@@ -583,10 +583,16 @@ fn announce_launch(
 ) {
     match stable_path {
         Some(path) => {
-            let _ = writeln!(out, "{}", stable_launch_hint(host, port, path));
+            if let Err(err) = writeln!(out, "{}", stable_launch_hint(host, port, path)) {
+                // The URL is the only way in for a stable token, so a lost write
+                // must not be silent.
+                eprintln!("warning: could not print the dashboard address: {err}");
+            }
         }
         None => {
-            let _ = writeln!(out, "Open this URL: {url}");
+            if let Err(err) = writeln!(out, "Open this URL: {url}") {
+                eprintln!("warning: could not print the dashboard address: {err}");
+            }
             launch(url);
         }
     }
