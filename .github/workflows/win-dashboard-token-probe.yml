@@ -118,3 +118,79 @@ jobs:
           $missing = Probe "missing" 19079 $token
           if ($missing.Status -ne 401) { throw "no file: expected 401, got $($missing.Status)" }
           Write-Host "E2E OK: 200 with owner-only file, 401 when Everyone can read it, 401 without a file; token never printed"
+
+  probe-non-elevated:
+    # The runner account is an elevated administrator. Run the same tests as a
+    # fresh standard user, where `icacls /setowner` fails, to show the
+    # foreign-owner test skips instead of failing and the rest still pass.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stub frontend build output
+        run: |
+          New-Item -ItemType Directory -Force packages/dashboard/dist | Out-Null
+          Set-Content packages/dashboard/dist/index.html '<!doctype html><title>probe</title>'
+      - name: Build the test binary
+        working-directory: packages/dashboard/src-tauri
+        run: |
+          cargo test --lib --no-run 2>&1 | Tee-Object build.log
+          $line = Get-Content build.log | Select-String -Pattern 'Executable unittests src[\\/]lib\.rs \((.+)\)' | Select-Object -First 1
+          if (-not $line) { throw "test binary not found" }
+          $exe = (Resolve-Path $line.Matches[0].Groups[1].Value).Path
+          "TEST_EXE=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: "Run serve:: tests as a standard user"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "mcprobe"
+          $plain = "Mc!" + [guid]::NewGuid().ToString("N").Substring(0, 16)
+          $pw = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name $name -Password $pw -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Users" -Member $name -ErrorAction SilentlyContinue
+          $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$name", $pw)
+          $work = "C:\mcprobe-work"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          icacls $work /grant "${name}:(OI)(CI)F" | Out-Null
+          # Run the binary in place (it may load DLLs from target/), readable by
+          # the new user; its temp files go to a directory it owns.
+          icacls $env:GITHUB_WORKSPACE /grant "${name}:(OI)(CI)RX" /T /Q | Out-Null
+          $env:TEMP = $work; $env:TMP = $work
+          $out = "$work\out.txt"; $err = "$work\err.txt"
+          $p = Start-Process -FilePath $env:TEST_EXE `
+            -ArgumentList "serve::", "--test-threads=1", "--nocapture" `
+            -Credential $cred -LoadUserProfile -WorkingDirectory $work `
+            -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+          $stdout = Get-Content -Raw $out; $stderr = Get-Content -Raw $err
+          Write-Host "--- stdout ---"; Write-Host $stdout
+          Write-Host "--- stderr ---"; Write-Host $stderr
+          if ($p.ExitCode -ne 0) { throw "tests failed as a standard user (exit $($p.ExitCode))" }
+          if (-not "$stdout$stderr".Contains("skipped: icacls /setowner failed")) {
+            throw "expected the foreign-owner test to skip for a standard user"
+          }
+          Write-Host "NON-ELEVATED OK: all serve:: tests pass, foreign-owner test skipped"
+
+  probe-linux:
+    # Exercises the POSIX ACL tests with setfacl installed, so they run rather
+    # than skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf acl
+      - name: Stub frontend build output
+        run: |
+          mkdir -p packages/dashboard/dist
+          echo '<!doctype html><title>probe</title>' > packages/dashboard/dist/index.html
+      - name: Unit tests (serve::)
+        working-directory: packages/dashboard/src-tauri
+        run: |
+          cargo test --locked --lib serve:: -- --test-threads=1 --nocapture 2>&1 | tee test.log
+          grep -q "posix_acl_tests::effective_named_user_entry_is_refused ... ok" test.log
+          grep -q "posix_acl_tests::named_user_entry_with_an_empty_mask_is_accepted ... ok" test.log
+          ! grep -q "setfacl is not installed" test.log
