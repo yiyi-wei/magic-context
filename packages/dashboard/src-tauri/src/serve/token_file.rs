@@ -5,9 +5,10 @@
 //! storage directory themselves. The file is honoured only when it is opened
 //! without following a symlink, is a regular file, is owner-only (Unix: owned
 //! by the current user with mode exactly `0600` and no access-control entry that
-//! grants another user; Windows: owned by the current user and accessible only
-//! to that user, SYSTEM and Administrators), and its
-//! trimmed contents are a URL-safe token of `MIN_TOKEN_LEN..=MAX_TOKEN_LEN`
+//! grants another user; Windows: owned by a trusted principal — the current
+//! user, SYSTEM or Administrators, because an elevated shell creates the file
+//! under one of those — and with access granted to no one but those three), and
+//! its trimmed contents are a URL-safe token of `MIN_TOKEN_LEN..=MAX_TOKEN_LEN`
 //! characters. Anything else is ignored with a warning that names the failed
 //! check and never the contents, and the process keeps the random token.
 
@@ -44,19 +45,49 @@ pub fn default_token_path() -> Option<PathBuf> {
     )
 }
 
+/// Why `default_token_path` produced no path, when a variable the user set is
+/// the reason. Serve mode prints this, so an override that cannot name an
+/// absolute directory explains itself instead of silently dropping a token file
+/// the user just created.
+pub fn default_token_path_warning() -> Option<&'static str> {
+    warning_from(
+        std::env::var_os("MAGIC_CONTEXT_STORAGE_DIR"),
+        std::env::var_os("XDG_DATA_HOME"),
+        dirs::home_dir(),
+    )
+}
+
+fn warning_from(
+    storage_dir: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<&'static str> {
+    if token_path_from(storage_dir.clone(), xdg_data_home.clone(), home).is_some() {
+        return None;
+    }
+    if storage_dir.and_then(non_blank).is_some() {
+        return Some("ignoring MAGIC_CONTEXT_STORAGE_DIR because it is not an absolute path");
+    }
+    if xdg_data_home.and_then(non_blank).is_some() {
+        return Some("ignoring XDG_DATA_HOME because it is not an absolute path");
+    }
+    None
+}
+
+fn non_blank(value: OsString) -> Option<PathBuf> {
+    match value.to_str() {
+        Some(text) => Some(text.trim())
+            .filter(|t| !t.is_empty())
+            .map(PathBuf::from),
+        None => Some(PathBuf::from(value)),
+    }
+}
+
 fn token_path_from(
     storage_dir: Option<OsString>,
     xdg_data_home: Option<OsString>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let non_blank = |value: OsString| -> Option<PathBuf> {
-        match value.to_str() {
-            Some(text) => Some(text.trim())
-                .filter(|t| !t.is_empty())
-                .map(PathBuf::from),
-            None => Some(PathBuf::from(value)),
-        }
-    };
     let dir = match storage_dir.and_then(non_blank) {
         Some(explicit) => explicit,
         None => xdg_data_home
@@ -429,6 +460,7 @@ mod macos_acl {
         fn acl_get_flag_np(flagset_d: *mut Flagset, flag: c_int) -> c_int;
         fn acl_get_qualifier(entry_d: *mut c_void) -> *mut c_void;
         fn acl_free(obj_p: *mut c_void) -> c_int;
+        fn acl_size(acl: *mut c_void) -> isize;
         fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> c_int;
     }
 
@@ -470,12 +502,28 @@ mod macos_acl {
             }
             seen += 1;
             entry = ptr::null_mut();
+            // SAFETY: as above.
             status = unsafe { acl_get_entry(acl.0, ACL_NEXT_ENTRY, &mut entry) };
         }
-        if status != -1 {
+        // The walk ends with -1 and EINVAL whether the list is exhausted or the
+        // call failed, so the end alone proves nothing. Reconcile the count
+        // against acl_size(), which reports KAUTH_FILESEC_SIZE(entry count)
+        // from <sys/kauth.h>; a walk that stopped early is refused.
+        // SAFETY: `acl` is live.
+        let size = unsafe { acl_size(acl.0) };
+        if status != -1 || entry_count(size) != Some(seen) {
             return Err(UNREADABLE);
         }
         Ok(())
+    }
+
+    /// KAUTH_FILESEC_COUNT: a filesec header (magic, owner and group guids,
+    /// entry count, flags) followed by fixed-size entries (guid, flags, rights).
+    pub(super) fn entry_count(size: isize) -> Option<usize> {
+        const HEADER: usize = 4 + UUID_LEN + UUID_LEN + 4 + 4;
+        const ENTRY: usize = UUID_LEN + 4 + 4;
+        let body = usize::try_from(size).ok()?.checked_sub(HEADER)?;
+        (body % ENTRY == 0).then_some(body / ENTRY)
     }
 
     /// Whether one ACL entry lets somebody other than the current user in.
@@ -787,6 +835,32 @@ mod macos_acl_tests {
         add_entry(&path, &format!("user:{} allow read", current_user()));
         assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
     }
+
+    #[test]
+    fn several_harmless_entries_are_all_walked() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        // The end of the list and a failed walk look alike, so the count is
+        // reconciled against acl_size(): a walk that stops early is refused.
+        for user in ["root", "daemon", "nobody"] {
+            add_entry(&path, &format!("user:{user} deny read"));
+        }
+        add_entry(&path, &format!("user:{} allow read", current_user()));
+        assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
+    }
+
+    #[test]
+    fn entry_count_comes_from_the_filesec_size() {
+        // KAUTH_FILESEC_SIZE(count) = header + count * entry, measured against
+        // acl_size() on this platform for 1, 2, 3, 5 and 7 entries.
+        assert_eq!(macos_acl::entry_count(68), Some(1));
+        assert_eq!(macos_acl::entry_count(212), Some(7));
+        // Too small to hold even the header, or a size that is not a whole
+        // number of entries, means the list cannot be trusted.
+        assert_eq!(macos_acl::entry_count(43), None);
+        assert_eq!(macos_acl::entry_count(70), None);
+        assert_eq!(macos_acl::entry_count(-1), None);
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +894,29 @@ mod content_tests {
             token_path_from(Some("rel".into()), os(&abs("xdg")), Some(abs("home"))),
             None
         );
+    }
+
+    #[test]
+    fn a_relative_override_explains_why_the_token_file_is_ignored() {
+        assert_eq!(
+            warning_from(Some("rel".into()), os(&abs("xdg")), Some(abs("home"))),
+            Some("ignoring MAGIC_CONTEXT_STORAGE_DIR because it is not an absolute path")
+        );
+        assert_eq!(
+            warning_from(Some("  ".into()), Some("rel".into()), Some(abs("home"))),
+            Some("ignoring XDG_DATA_HOME because it is not an absolute path")
+        );
+    }
+
+    #[test]
+    fn nothing_is_said_when_the_path_resolves_or_no_variable_can_be_blamed() {
+        assert_eq!(
+            warning_from(os(&abs("store")), os(&abs("xdg")), Some(abs("home"))),
+            None
+        );
+        // No variable set and no home directory: nothing the user can fix by
+        // editing a variable, so the startup output stays quiet.
+        assert_eq!(warning_from(None, None, None), None);
     }
 
     #[test]
