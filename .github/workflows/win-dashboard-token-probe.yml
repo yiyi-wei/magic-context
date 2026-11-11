@@ -1,0 +1,102 @@
+name: Windows dashboard stable token probe
+
+# Temporary, fork-only check for #447 (not part of the PR): runs the Windows
+# owner-only ACL tests for the dashboard's stable token file on a real Windows
+# host, then starts the real `--serve` binary with a token file and checks the
+# API accepts it, and refuses it once other users can read the file.
+on:
+  push:
+    branches: [ci/windows-token-447]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Stub frontend build output
+        # tauri::generate_context! and rust-embed need ../dist; the probe only
+        # exercises /api, so a placeholder page is enough.
+        run: |
+          New-Item -ItemType Directory -Force packages/dashboard/dist | Out-Null
+          Set-Content packages/dashboard/dist/index.html '<!doctype html><title>probe</title>'
+
+      - name: whoami / elevation
+        run: |
+          whoami /user
+          whoami /groups | Select-String -Pattern "Administrators|Mandatory Label"
+          icacls $env:TEMP
+
+      - name: Unit tests (serve::token_file, serve::tests)
+        working-directory: packages/dashboard/src-tauri
+        run: "cargo test --lib serve:: -- --nocapture --test-threads=1"
+
+      - name: Build binary
+        working-directory: packages/dashboard/src-tauri
+        run: cargo build
+
+      - name: End-to-end with the real binary
+        working-directory: packages/dashboard/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = (Resolve-Path target/debug/magic-context-dashboard.exe).Path
+          $data = Join-Path $env:USERPROFILE "mc-probe-data"
+          $dir = Join-Path $data "cortexkit\magic-context"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $file = Join-Path $dir "dashboard-token"
+          $env:XDG_DATA_HOME = $data
+
+          $bytes = New-Object byte[] 32
+          [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $token = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+          Set-Content -NoNewline -Encoding ascii $file $token
+
+          function Probe([string]$label, [int]$port, [string]$bearer) {
+            $out = Join-Path $env:RUNNER_TEMP "$label.out"
+            $err = Join-Path $env:RUNNER_TEMP "$label.err"
+            $p = Start-Process -FilePath $bin -ArgumentList "--serve", "$port" -PassThru `
+              -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
+            $status = $null
+            for ($i = 0; $i -lt 60 -and $null -eq $status; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/invoke" -Method Post `
+                  -Headers @{ Authorization = "Bearer $bearer" } -ContentType 'application/json' `
+                  -Body '{"cmd":"list_workspaces","args":{}}' -SkipHttpErrorCheck
+                $status = [int]$r.StatusCode
+              } catch { }
+            }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+            $stdout = Get-Content -Raw $out -ErrorAction SilentlyContinue
+            $stderr = Get-Content -Raw $err -ErrorAction SilentlyContinue
+            Write-Host "[$label] http=$status"
+            Write-Host "[$label] stdout: $stdout"
+            Write-Host "[$label] stderr: $stderr"
+            $leaked = ("$stdout$stderr").Contains($token)
+            return @{ Status = $status; Leaked = $leaked; Stderr = "$stderr" }
+          }
+
+          Write-Host "--- token file ACL as created under the profile ---"
+          icacls $file
+
+          $good = Probe "good" 19077 $token
+          if ($good.Status -ne 200) { throw "owner-only file: expected 200, got $($good.Status)" }
+          if ($good.Leaked) { throw "stable token was printed" }
+
+          icacls $file /grant "*S-1-1-0:(R)" | Out-Host
+          icacls $file
+          $open = Probe "everyone-read" 19078 $token
+          if ($open.Status -ne 401) { throw "Everyone-readable file: expected 401, got $($open.Status)" }
+          if (-not $open.Stderr.Contains("other users")) { throw "missing warning for Everyone-readable file" }
+
+          Remove-Item $file
+          $missing = Probe "missing" 19079 $token
+          if ($missing.Status -ne 401) { throw "no file: expected 401, got $($missing.Status)" }
+          Write-Host "E2E OK: 200 with owner-only file, 401 when Everyone can read it, 401 without a file; token never printed"
