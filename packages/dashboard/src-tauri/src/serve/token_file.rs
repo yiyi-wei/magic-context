@@ -4,8 +4,9 @@
 //! wants a bookmarkable URL can create `dashboard-token` in the Magic Context
 //! storage directory themselves. The file is honoured only when it is opened
 //! without following a symlink, is a regular file, is owner-only (Unix: owned
-//! by the current user with mode exactly `0600`; Windows: owned by the current
-//! user and accessible only to that user, SYSTEM and Administrators), and its
+//! by the current user with mode exactly `0600` and no access-control entry that
+//! grants another user; Windows: owned by the current user and accessible only
+//! to that user, SYSTEM and Administrators), and its
 //! trimmed contents are a URL-safe token of `MIN_TOKEN_LEN..=MAX_TOKEN_LEN`
 //! characters. Anything else is ignored with a warning that names the failed
 //! check and never the contents, and the process keeps the random token.
@@ -153,6 +154,10 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
     if metadata.mode() & 0o777 != 0o600 {
         return Err("it must have owner-only permissions (0600)");
     }
+    // On macOS an access-control entry grants access without changing the mode
+    // bits, so `0600` alone does not mean owner-only (see `macos_acl`).
+    #[cfg(target_os = "macos")]
+    macos_acl::check_owner_only(&file)?;
     read_limited(file)
 }
 
@@ -370,6 +375,162 @@ mod windows_acl {
     }
 }
 
+/// The macOS rule for "owner-only". macOS keeps access-control entries outside
+/// the mode bits, so a file with mode `0600` can still grant another local user
+/// read access:
+///
+/// ```text
+/// $ chmod 600 token && chmod +a "user:nobody allow read" token
+/// $ stat -f %Sp token   ->  -rw-------
+/// $ ls -le token        ->  0: user:nobody allow read
+/// ```
+///
+/// Every entry on the file is therefore inspected through the same open handle:
+/// a deny entry is skipped (it only takes access away), as is an inherit-only
+/// entry (a template for children that does not apply to the file), and every
+/// remaining allow entry must name the current user. Anything else—including a
+/// group entry, which cannot be proven to exclude other members—is refused,
+/// and an unknown entry type is refused because it cannot be judged here.
+#[cfg(target_os = "macos")]
+mod macos_acl {
+    use std::ffi::{c_int, c_void};
+    use std::fs::File;
+    use std::io::ErrorKind;
+    use std::os::unix::io::AsRawFd;
+    use std::ptr;
+
+    pub(super) const OTHER_USERS: &str = "other users can reach it through its access-control list";
+    pub(super) const UNKNOWN_ACE: &str =
+        "its access-control list has entries that cannot be verified";
+    const UNREADABLE: &str = "its access-control list could not be read";
+    /// Refuses an ACL that never ends rather than spinning on a broken libc.
+    const MAX_ENTRIES: usize = 1 << 16;
+
+    // From <sys/acl.h>. `libc` exposes none of these on Apple targets.
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    const ACL_EXTENDED_DENY: c_int = 2;
+    const ACL_ENTRY_ONLY_INHERIT: c_int = 1 << 8;
+    const UUID_LEN: usize = 16;
+
+    /// Opaque `struct _acl_permset` / `_acl_flagset` handles.
+    #[repr(C)]
+    struct Flagset {
+        _private: [u8; 0],
+    }
+
+    extern "C" {
+        fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry_p: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry_d: *mut c_void, tag_type_p: *mut c_int) -> c_int;
+        fn acl_get_flagset_np(obj_p: *mut c_void, flagset_p: *mut *mut Flagset) -> c_int;
+        fn acl_get_flag_np(flagset_d: *mut Flagset, flag: c_int) -> c_int;
+        fn acl_get_qualifier(entry_d: *mut c_void) -> *mut c_void;
+        fn acl_free(obj_p: *mut c_void) -> c_int;
+        fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> c_int;
+    }
+
+    /// Frees an ACL returned by `acl_get_fd_np`.
+    struct AclBox(*mut c_void);
+    impl Drop for AclBox {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from acl_get_fd_np and is freed once.
+            unsafe { acl_free(self.0) };
+        }
+    }
+
+    pub(super) fn check_owner_only(file: &File) -> Result<(), &'static str> {
+        let me = current_user_uuid()?;
+        // SAFETY: the file handle stays open for the whole call.
+        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            // Ordinary case: no extended ACL at all, so the mode bits checked
+            // by the caller are the whole story. Anything else is unreadable.
+            return match std::io::Error::last_os_error().kind() {
+                ErrorKind::NotFound => Ok(()),
+                _ => Err(UNREADABLE),
+            };
+        }
+        let acl = AclBox(acl);
+        let mut entry: *mut c_void = ptr::null_mut();
+        // SAFETY: `acl` is live and `entry` receives an entry owned by it.
+        let mut status = unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &mut entry) };
+        let mut seen = 0usize;
+        // Darwin returns 0 per entry and -1 once the list is exhausted; a
+        // negative status is how it reports both that and a real failure.
+        while status == 0 {
+            if seen >= MAX_ENTRIES || entry.is_null() {
+                return Err(UNREADABLE);
+            }
+            // SAFETY: `entry` belongs to the live ACL and is only read here.
+            if unsafe { grants_another_user(entry, &me) }? {
+                return Err(OTHER_USERS);
+            }
+            seen += 1;
+            entry = ptr::null_mut();
+            status = unsafe { acl_get_entry(acl.0, ACL_NEXT_ENTRY, &mut entry) };
+        }
+        if status != -1 {
+            return Err(UNREADABLE);
+        }
+        Ok(())
+    }
+
+    /// Whether one ACL entry lets somebody other than the current user in.
+    ///
+    /// # Safety
+    /// `entry` must be an entry of a live ACL.
+    unsafe fn grants_another_user(
+        entry: *mut c_void,
+        me: &[u8; UUID_LEN],
+    ) -> Result<bool, &'static str> {
+        let mut tag: c_int = 0;
+        if acl_get_tag_type(entry, &mut tag) != 0 {
+            return Err(UNREADABLE);
+        }
+        match tag {
+            // Only takes access away, so it cannot grant anybody anything.
+            ACL_EXTENDED_DENY => Ok(false),
+            ACL_EXTENDED_ALLOW => {
+                let mut flags: *mut Flagset = ptr::null_mut();
+                if acl_get_flagset_np(entry, &mut flags) != 0 || flags.is_null() {
+                    return Err(UNREADABLE);
+                }
+                // A template for children; it does not apply to this file. A
+                // negative answer is an error, not "not set", and is refused.
+                match acl_get_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) {
+                    1 => return Ok(false),
+                    0 => {}
+                    _ => return Err(UNREADABLE),
+                }
+                let qualifier = acl_get_qualifier(entry);
+                if qualifier.is_null() {
+                    return Err(UNREADABLE);
+                }
+                // The qualifier of an extended entry is a 16-byte uuid, not a uid.
+                let mut uuid = [0u8; UUID_LEN];
+                uuid.copy_from_slice(std::slice::from_raw_parts(qualifier as *const u8, UUID_LEN));
+                acl_free(qualifier);
+                Ok(uuid != *me)
+            }
+            _ => Err(UNKNOWN_ACE),
+        }
+    }
+
+    /// The uuid macOS uses for this user in an extended ACL entry.
+    fn current_user_uuid() -> Result<[u8; UUID_LEN], &'static str> {
+        let mut uuid = [0u8; UUID_LEN];
+        // SAFETY: geteuid cannot fail; `uuid` is a 16-byte buffer as required.
+        let status = unsafe { mbr_uid_to_uuid(libc::geteuid(), uuid.as_mut_ptr()) };
+        if status != 0 {
+            return Err(UNREADABLE);
+        }
+        Ok(uuid)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -505,6 +666,126 @@ mod tests {
             write_with_mode(&path, token.as_bytes(), 0o600);
             assert_eq!(read_token_file(&path), TokenFile::Loaded(token));
         }
+    }
+}
+
+/// macOS keeps access-control entries outside the mode bits, so these cases are
+/// the ones `0600` alone lets through. Each one is built with `chmod +a` on a
+/// copy of a file that already passed every other check.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_acl_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    const GOOD: &str = "Abcdefghijklmnopqrstuvwxyz0123456789-._~";
+
+    fn write_0600(dir: &Path) -> PathBuf {
+        let path = dir.join(TOKEN_FILE_NAME);
+        let _ = fs::remove_file(&path);
+        fs::write(&path, GOOD.as_bytes()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// Adds one access-control entry. Fails the test (rather than silently
+    /// passing) when the entry could not be created, since then the case would
+    /// be exercising nothing.
+    fn add_entry(path: &Path, entry: &str) {
+        let out = Command::new("chmod")
+            .arg("+a")
+            .arg(entry)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "chmod +a {entry:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Guard against the entry being rejected by chmod in some other way.
+        let listing = Command::new("ls").arg("-le").arg(path).output().unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        assert!(
+            listing.contains("user:") || listing.contains("group:"),
+            "no entry was added to {path:?}:\n{listing}"
+        );
+    }
+
+    fn current_user() -> String {
+        // SAFETY: getpwuid returns a pointer into a static buffer or null.
+        let name = unsafe {
+            let pw = libc::getpwuid(libc::geteuid());
+            if pw.is_null() {
+                None
+            } else {
+                std::ffi::CStr::from_ptr((*pw).pw_name)
+                    .to_str()
+                    .ok()
+                    .map(str::to_owned)
+            }
+        };
+        name.expect("the current user has no name")
+    }
+
+    #[test]
+    fn file_without_extended_acl_is_loaded() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
+    }
+
+    #[test]
+    fn entry_granting_another_user_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        // Mode stays 0600, so the check this test is about is reached.
+        add_entry(&path, "user:nobody allow read");
+        assert_eq!(
+            read_token_file(&path),
+            TokenFile::Rejected("other users can reach it through its access-control list")
+        );
+    }
+
+    #[test]
+    fn group_entry_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        // `wheel` is a group the current user is not in, so this entry names
+        // other users; a group entry cannot prove it names only the owner.
+        add_entry(&path, "group:wheel allow read");
+        assert_eq!(
+            read_token_file(&path),
+            TokenFile::Rejected("other users can reach it through its access-control list")
+        );
+    }
+
+    #[test]
+    fn inherit_only_entry_does_not_count() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        // A template for children; it grants nothing on this file.
+        add_entry(&path, "user:nobody allow read,only_inherit");
+        assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
+    }
+
+    #[test]
+    fn deny_entry_does_not_count() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        // Deny only removes access, so it cannot be the reason to refuse.
+        add_entry(&path, "user:root deny read");
+        assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
+    }
+
+    #[test]
+    fn entry_naming_the_current_user_is_accepted() {
+        let dir = tempdir().unwrap();
+        let path = write_0600(dir.path());
+        add_entry(&path, &format!("user:{} allow read", current_user()));
+        assert_eq!(read_token_file(&path), TokenFile::Loaded(GOOD.to_string()));
     }
 }
 
