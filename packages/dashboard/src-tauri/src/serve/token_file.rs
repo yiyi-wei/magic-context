@@ -139,14 +139,19 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
     use std::fs::OpenOptions;
     use std::io::ErrorKind;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, READ_CONTROL,
     };
 
     let file = match OpenOptions::new()
-        // READ_CONTROL lets GetSecurityInfo read the owner and DACL off this handle.
-        .access_mode(GENERIC_READ | READ_CONTROL)
+        // The exact bits, not GENERIC_READ: GENERIC_READ also asks for
+        // SYNCHRONIZE and READ_CONTROL (0x120089 & 0x120116 overlap with
+        // FILE_GENERIC_WRITE), so a `deny write` ACE would refuse an open that
+        // only wants to read. FILE_READ_ATTRIBUTES is what std's metadata()
+        // needs; READ_CONTROL is what GetSecurityInfo needs below.
+        .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL)
         // Opens a symlink or junction itself instead of its target.
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -156,6 +161,9 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
         // Without backup semantics a directory cannot be opened; name it anyway.
         Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) => {
             return Err("it is not a regular file");
+        }
+        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            return Err("access to it was denied");
         }
         Err(_) => return Err("it could not be opened"),
     };
@@ -619,8 +627,6 @@ mod windows_tests {
         for sddl in [
             format!("D:P(A;;FA;;;{user})"),
             format!("D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)"),
-            // Deny entries only take access away.
-            format!("D:P(D;;FW;;;WD)(A;;FA;;;{user})"),
         ] {
             let path = token_file_with_dacl(dir.path(), &sddl);
             assert_eq!(
@@ -629,6 +635,25 @@ mod windows_tests {
                 "{sddl}"
             );
         }
+    }
+
+    /// A deny entry takes access away, so it must never be read as a grant.
+    /// Opening the file for the check asks for READ_CONTROL, which sits inside
+    /// the `deny write` mask, so the open itself can be refused before the
+    /// access list is read. Either outcome is safe; a grant is what is not, and
+    /// `it could not be opened` is not an acceptable explanation.
+    #[test]
+    fn deny_entry_is_never_read_as_a_grant() {
+        let dir = tempdir().unwrap();
+        let sddl = format!("D:P(D;;FW;;;WD)(A;;FA;;;{})", user_sid());
+        let path = token_file_with_dacl(dir.path(), &sddl);
+        let outcome = read_token_file(&path);
+        assert_ne!(outcome, TokenFile::Rejected(OTHER_USERS), "{sddl}");
+        assert!(
+            outcome == TokenFile::Loaded(GOOD.to_string())
+                || outcome == TokenFile::Rejected("access to it was denied"),
+            "unexpected outcome: {outcome:?}"
+        );
     }
 
     #[test]
