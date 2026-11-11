@@ -66,9 +66,13 @@ jobs:
             for ($i = 0; $i -lt 60 -and $null -eq $status; $i++) {
               Start-Sleep -Milliseconds 500
               try {
+                # get_db_health answers without a database, so the status code
+                # reports the token decision alone: 200 for an accepted file and
+                # 401 for a refused one. list_workspaces would open SQLite and
+                # answer 400 on a runner with no database, hiding the difference.
                 $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/invoke" -Method Post `
                   -Headers @{ Authorization = "Bearer $bearer" } -ContentType 'application/json' `
-                  -Body '{"cmd":"list_workspaces","args":{}}' -SkipHttpErrorCheck
+                  -Body '{"cmd":"get_db_health","args":{}}' -SkipHttpErrorCheck
                 $status = [int]$r.StatusCode
               } catch { }
             }
